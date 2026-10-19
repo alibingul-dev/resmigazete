@@ -15,6 +15,8 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
       - run: python main_resmi.py
+      - run: sudo apt-get update -q && sudo apt-get install -y -q poppler-utils tesseract-ocr tesseract-ocr-tur
+      - run: python scripts/rg_reader.py
       - uses: actions/upload-artifact@v4
         with:
           name: resmi-gazete
