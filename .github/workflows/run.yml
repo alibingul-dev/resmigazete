@@ -15,10 +15,6 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
       - run: python main_resmi.py
-      - run: sudo apt-get update && sudo apt-get install -y poppler-utils
-      - run: |
-          shopt -s nullglob
-          for f in rg/*.pdf; do pdftotext -layout "$f" "${f%.pdf}.txt"; done
       - uses: actions/upload-artifact@v4
         with:
           name: resmi-gazete
@@ -27,6 +23,6 @@ jobs:
       - run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git add rg ':(exclude)rg/*.pdf'
+          git add rg
           git commit -m "Resmi Gazete $(date +%Y%m%d)" || echo "Degisiklik yok"
           git push
