@@ -13,21 +13,27 @@ Girdi : rg/Resmi_Gazete_YYYYMMDD-N.htm | .pdf   (tam sayı PDF'i — tiresiz ola
 
 Metin yolu:
   .htm  → windows-1254 çöz, etiketleri sil
-  .pdf  → pdftotext; metin Türkçe değilse (bozuk font kodlaması / taranmış sayfa) → OCR (tesseract -l tur)
+  .pdf  → pdftotext; bozuksa gömülü fontun glifleri OCR oylamasıyla çözülür (method "glyph", rakamlar birebir);
+          metin katmanı olmayan taranmış sayfalar OCR (method "ocr" — rakamlar doğrulanmalı)
 
 Kullanım:
   python3 scripts/rg_reader.py            # rg/ içindeki tüm tarihler
   python3 scripts/rg_reader.py --keep     # kaynak dosyaları silme (test için)
 
-Gerekenler: poppler-utils (pdftotext, pdftoppm), tesseract-ocr + tesseract-ocr-tur
+Gerekenler: poppler-utils, tesseract-ocr + tesseract-ocr-tur, pip: pymupdf fonttools
 """
+import collections
 import html
+import io
 import json
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+import pymupdf
+from fontTools.ttLib import TTFont
 
 RG = Path(__file__).resolve().parent.parent / "rg"
 NAME_RE = re.compile(r"^Resmi_Gazete_(\d{8})(?:-(\d+))?\.(htm|pdf|txt)$")
@@ -72,16 +78,108 @@ def htm_text(p: Path) -> str:
     return re.sub(r"\n\s*\n+", "\n", t).strip()
 
 
+DPI = 300
+
+def ocr_words(png):
+    out = subprocess.run(["tesseract", png, "-", "-l", "tur", "--psm", "4", "tsv"],
+                         capture_output=True, text=True).stdout.splitlines()[1:]
+    words = []
+    for line in out:
+        c = line.split("\t")
+        if len(c) == 12 and c[11].strip() and float(c[10]) > 60:
+            x, y, w, h = map(int, c[6:10])
+            words.append((x, y, x + w, y + h, c[11].strip()))
+    return words
+
+def page_chars(page):
+    """Gerçek glif kimlikleriyle (texttrace) karakterler: (key, x0, y0, x1, y1, size, oy)."""
+    chars = []
+    for t in page.get_texttrace():
+        if t["type"] == 3 or t["opacity"] == 0:   # görünmez metin
+            continue
+        for ch in t["chars"]:
+            x0, y0, x1, y1 = ch[3]
+            chars.append(((t["font"], ch[1]), x0, y0, x1, y1, t["size"], ch[2][1]))
+    return chars
+
+def glyph_decode(path):
+    doc = pymupdf.open(path)
+    votes = collections.defaultdict(collections.Counter)
+    k = DPI / 72
+    with tempfile.TemporaryDirectory() as d:
+        for i, page in enumerate(doc):
+            png = f"{d}/p{i}.png"
+            page.get_pixmap(dpi=DPI, colorspace="gray").save(png)
+            chars = page_chars(page)
+            for (wx0, wy0, wx1, wy1, word) in ocr_words(png):
+                inside = [c for c in chars
+                          if wx0 <= (c[1] + c[3]) / 2 * k <= wx1 and wy0 <= (c[2] + c[4]) / 2 * k <= wy1]
+                inside.sort(key=lambda c: c[1])
+                inside = [c for c in inside if c[3] - c[1] > 0.5]  # boşluk glifleri genişlik ~0 değil ama OCR kelimesinde yok
+                if len(inside) == len(word):
+                    for c, w in zip(inside, word):
+                        votes[c[0]][w] += 1
+    mapping = {g: v.most_common(1)[0][0] for g, v in votes.items()}
+    # boş (çizimi olmayan) glifler boşluktur — oylamaya bırakılmaz
+    seen = set()
+    for pno in range(len(doc)):
+        for f in doc.get_page_fonts(pno):
+            if f[0] in seen: continue
+            seen.add(f[0])
+            base = f[3].split("+", 1)[-1]
+            try:
+                buf = doc.extract_font(f[0])[3]
+                tt = TTFont(io.BytesIO(buf)); glyf = tt["glyf"]
+                for gid, gname in enumerate(tt.getGlyphOrder()):
+                    if glyf[gname].numberOfContours == 0:
+                        mapping[(base, gid)] = " "
+            except Exception:
+                pass
+    # metni PDF'in kendi glif dizisinden yeniden kur
+    pages_out = []
+    for page in doc:
+        lines_out = []
+        rows = collections.defaultdict(list)
+        for c in page_chars(page):
+            rows[round(c[6] / 2)].append(c)          # aynı taban çizgisi = aynı satır
+        for y in sorted(rows):
+            row = sorted(rows[y], key=lambda c: c[1])
+            out, prev = [], None
+            for c in row:
+                if prev is not None and c[1] - prev[3] > 0.2 * c[5]:
+                    out.append(" ")                    # glifler arası boşluk
+                ch = mapping.get(c[0])
+                out.append(ch if ch is not None else "\ufffd")
+                prev = c
+            lines_out.append(re.sub(r" {2,}", " ", "".join(out)).rstrip())
+        pages_out.append("\n".join(lines_out))
+    return pages_out
+
+
+def ocr_png(png: str) -> str:
+    return run(["tesseract", png, "-", "-l", "tur", "--psm", "4"])
+
+
 def pdf_text(p: Path) -> tuple[str, str]:
+    """1) pdftotext düzgünse onu kullan.
+    2) Metin katmanı var ama font kodlaması bozuksa (ToUnicode yok): glifleri OCR oylamasıyla çöz —
+       metin PDF'in kendi glif dizisinden kurulur, rakamlar birebir doğru gelir.
+    3) Metin katmanı olmayan (taranmış) sayfalar: OCR."""
     t = run(["pdftotext", "-layout", str(p), "-"])
     if looks_turkish(t):
         return t, "pdftotext"
-    out = []
+    doc = pymupdf.open(str(p))
+    glyph_pages = glyph_decode(str(p))
+    out, methods = [], set()
     with tempfile.TemporaryDirectory() as d:
-        run(["pdftoppm", "-r", "300", "-gray", "-png", str(p), f"{d}/pg"])
-        for img in sorted(Path(d).glob("pg-*.png"), key=lambda x: int(x.stem.split("-")[-1])):
-            out.append(run(["tesseract", str(img), "-", "-l", "tur", "--psm", "4"]))
-    return "\n".join(out), "ocr"
+        for i, page in enumerate(doc):
+            if len(page_chars(page)) >= 200:
+                out.append(glyph_pages[i]); methods.add("glyph")
+            else:
+                png = f"{d}/o{i}.png"
+                page.get_pixmap(dpi=400, colorspace="gray").save(png)
+                out.append(ocr_png(png)); methods.add("ocr")
+    return "\n".join(out), "+".join(sorted(methods))
 
 
 def title_of(text: str, issuer_end: int) -> str:
