@@ -2,7 +2,7 @@ name: Run main_resmi.py
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "23 1 * * *"   # 04:23 TR — saat başı yoğunluğundan kaçın, 08:15 analistinden önce bitsin
 permissions:
   contents: write
 jobs:
