@@ -78,10 +78,14 @@ def htm_text(p: Path) -> str:
     return re.sub(r"\n\s*\n+", "\n", t).strip()
 
 
-DPI = 300
+# Resmî Gazete kuralı: her sayı en az 3 bağımsız turda aynı okunmadıkça "onaylı" sayılmaz.
+GLYPH_PASSES = [(200, "4"), (300, "4"), (400, "6")]   # (dpi, tesseract psm)
+OCR_PASSES = [(300, "4"), (400, "4"), (400, "6")]
+NUM_RE = re.compile(r"%?\d+(?:[.,/:]\d+)*")
 
-def ocr_words(png):
-    out = subprocess.run(["tesseract", png, "-", "-l", "tur", "--psm", "4", "tsv"],
+
+def ocr_words(png, psm="4"):
+    out = subprocess.run(["tesseract", png, "-", "-l", "tur", "--psm", psm, "tsv"],
                          capture_output=True, text=True).stdout.splitlines()[1:]
     words = []
     for line in out:
@@ -90,6 +94,7 @@ def ocr_words(png):
             x, y, w, h = map(int, c[6:10])
             words.append((x, y, x + w, y + h, c[11].strip()))
     return words
+
 
 def page_chars(page):
     """Gerçek glif kimlikleriyle (texttrace) karakterler: (key, x0, y0, x1, y1, size, oy)."""
@@ -102,84 +107,131 @@ def page_chars(page):
             chars.append(((t["font"], ch[1]), x0, y0, x1, y1, t["size"], ch[2][1]))
     return chars
 
-def glyph_decode(path):
-    doc = pymupdf.open(path)
+
+def glyph_votes(doc, dpi, psm, d):
     votes = collections.defaultdict(collections.Counter)
-    k = DPI / 72
+    k = dpi / 72
+    for i, page in enumerate(doc):
+        chars = page_chars(page)
+        if len(chars) < 200:
+            continue
+        png = f"{d}/g{dpi}_{psm}_{i}.png"
+        page.get_pixmap(dpi=dpi, colorspace="gray").save(png)
+        for (wx0, wy0, wx1, wy1, word) in ocr_words(png, psm):
+            inside = [c for c in chars
+                      if wx0 <= (c[1] + c[3]) / 2 * k <= wx1 and wy0 <= (c[2] + c[4]) / 2 * k <= wy1]
+            inside = sorted((c for c in inside if c[3] - c[1] > 0.5), key=lambda c: c[1])
+            if len(inside) == len(word):
+                for c, w in zip(inside, word):
+                    votes[c[0]][w] += 1
+    return votes
+
+
+def glyph_decode(path):
+    """3 bağımsız turda (farklı dpi/psm) glif → harf eşlemesi çıkarılır.
+    Üç turun üçünde de aynı harfe oturan glif 'onaylı'; değilse çoğunluk kullanılır ve işaretlenir."""
+    doc = pymupdf.open(path)
     with tempfile.TemporaryDirectory() as d:
-        for i, page in enumerate(doc):
-            png = f"{d}/p{i}.png"
-            page.get_pixmap(dpi=DPI, colorspace="gray").save(png)
-            chars = page_chars(page)
-            for (wx0, wy0, wx1, wy1, word) in ocr_words(png):
-                inside = [c for c in chars
-                          if wx0 <= (c[1] + c[3]) / 2 * k <= wx1 and wy0 <= (c[2] + c[4]) / 2 * k <= wy1]
-                inside.sort(key=lambda c: c[1])
-                inside = [c for c in inside if c[3] - c[1] > 0.5]  # boşluk glifleri genişlik ~0 değil ama OCR kelimesinde yok
-                if len(inside) == len(word):
-                    for c, w in zip(inside, word):
-                        votes[c[0]][w] += 1
-    mapping = {g: v.most_common(1)[0][0] for g, v in votes.items()}
-    # boş (çizimi olmayan) glifler boşluktur — oylamaya bırakılmaz
+        runs = [glyph_votes(doc, dpi, psm, d) for dpi, psm in GLYPH_PASSES]
+    tops = [{g: v.most_common(1)[0][0] for g, v in r.items()} for r in runs]
+    keys = set().union(*tops)
+    mapping, confirmed = {}, set()
+    for g in keys:
+        picks = [t[g] for t in tops if g in t]
+        best, n = collections.Counter(picks).most_common(1)[0]
+        mapping[g] = best
+        if n == len(GLYPH_PASSES):
+            confirmed.add(g)
+    # boş (çizimi olmayan) glifler boşluktur — kesin
     seen = set()
     for pno in range(len(doc)):
         for f in doc.get_page_fonts(pno):
-            if f[0] in seen: continue
+            if f[0] in seen:
+                continue
             seen.add(f[0])
             base = f[3].split("+", 1)[-1]
             try:
-                buf = doc.extract_font(f[0])[3]
-                tt = TTFont(io.BytesIO(buf)); glyf = tt["glyf"]
+                tt = TTFont(io.BytesIO(doc.extract_font(f[0])[3])); glyf = tt["glyf"]
                 for gid, gname in enumerate(tt.getGlyphOrder()):
                     if glyf[gname].numberOfContours == 0:
-                        mapping[(base, gid)] = " "
+                        mapping[(base, gid)] = " "; confirmed.add((base, gid))
             except Exception:
                 pass
-    # metni PDF'in kendi glif dizisinden yeniden kur
-    pages_out = []
+    pages_out, flags_out = [], []
     for page in doc:
-        lines_out = []
+        lines, flines = [], []
         rows = collections.defaultdict(list)
         for c in page_chars(page):
             rows[round(c[6] / 2)].append(c)          # aynı taban çizgisi = aynı satır
         for y in sorted(rows):
-            row = sorted(rows[y], key=lambda c: c[1])
-            out, prev = [], None
-            for c in row:
+            out, fl, prev = [], [], None
+            for c in sorted(rows[y], key=lambda c: c[1]):
                 if prev is not None and c[1] - prev[3] > 0.2 * c[5]:
-                    out.append(" ")                    # glifler arası boşluk
+                    out.append(" "); fl.append(True)
                 ch = mapping.get(c[0])
-                out.append(ch if ch is not None else "\ufffd")
+                out.append(ch if ch is not None else "\ufffd"); fl.append(c[0] in confirmed)
                 prev = c
-            lines_out.append(re.sub(r" {2,}", " ", "".join(out)).rstrip())
-        pages_out.append("\n".join(lines_out))
-    return pages_out
+            lines.append("".join(out)); flines.append(fl)
+        pages_out.append(lines); flags_out.append(flines)
+    stats = {"glyphs": len(keys), "unanimous": len(confirmed & keys)}
+    return pages_out, flags_out, stats
 
 
-def ocr_png(png: str) -> str:
-    return run(["tesseract", png, "-", "-l", "tur", "--psm", "4"])
+def unconfirmed_glyph_numbers(lines, flags):
+    bad = []
+    for line, fl in zip(lines, flags):
+        for m in NUM_RE.finditer(line):
+            if not all(fl[m.start():m.end()]):
+                bad.append(m.group())
+    return bad
 
 
-def pdf_text(p: Path) -> tuple[str, str]:
+def ocr_png(png: str, psm: str = "4") -> str:
+    return run(["tesseract", png, "-", "-l", "tur", "--psm", psm])
+
+
+def ocr_page_3pass(page, d, i):
+    """Taranmış sayfa: 3 tur OCR. Temel metin 400 dpi/psm4; bir sayı ancak üç turun üçünde de
+    aynı geçiyorsa onaylı. Not: sistematik hata (ör. '%' → '9') üç turda da aynı olabilir —
+    bu yüzden OCR sayfalarındaki sayılar ayrıca sayfa görüntüsünden kontrol edilmelidir."""
+    texts = []
+    for dpi, psm in OCR_PASSES:
+        png = f"{d}/o{i}_{dpi}_{psm}.png"
+        page.get_pixmap(dpi=dpi, colorspace="gray").save(png)
+        texts.append(ocr_png(png, psm))
+    base = texts[1]
+    sets = [collections.Counter(NUM_RE.findall(t)) for t in texts]
+    bad = [n for n in NUM_RE.findall(base) if not all(s[n] for s in sets)]
+    return base, bad
+
+
+def pdf_text(p: Path) -> tuple[str, str, dict]:
     """1) pdftotext düzgünse onu kullan.
-    2) Metin katmanı var ama font kodlaması bozuksa (ToUnicode yok): glifleri OCR oylamasıyla çöz —
-       metin PDF'in kendi glif dizisinden kurulur, rakamlar birebir doğru gelir.
-    3) Metin katmanı olmayan (taranmış) sayfalar: OCR."""
+    2) Metin katmanı var ama font kodlaması bozuksa (ToUnicode yok): glifler 3 turlu OCR oylamasıyla çözülür,
+       metin PDF'in kendi glif dizisinden kurulur.
+    3) Metin katmanı olmayan (taranmış) sayfalar: 3 tur OCR, sayılar turlar arası karşılaştırılır."""
     t = run(["pdftotext", "-layout", str(p), "-"])
     if looks_turkish(t):
-        return t, "pdftotext"
+        return t, "pdftotext", {"passes": 1, "unconfirmed_numbers": []}
     doc = pymupdf.open(str(p))
-    glyph_pages = glyph_decode(str(p))
-    out, methods = [], set()
+    g_pages, g_flags, gstats = glyph_decode(str(p))
+    out, methods, bad, ocr_pages = [], set(), [], []
     with tempfile.TemporaryDirectory() as d:
         for i, page in enumerate(doc):
             if len(page_chars(page)) >= 200:
-                out.append(glyph_pages[i]); methods.add("glyph")
+                out.append(re.sub(r" {2,}", " ", "\n".join(l.rstrip() for l in g_pages[i])))
+                bad += unconfirmed_glyph_numbers(g_pages[i], g_flags[i]); methods.add("glyph")
             else:
-                png = f"{d}/o{i}.png"
-                page.get_pixmap(dpi=400, colorspace="gray").save(png)
-                out.append(ocr_png(png)); methods.add("ocr")
-    return "\n".join(out), "+".join(sorted(methods))
+                txt, b = ocr_page_3pass(page, d, i)
+                out.append(txt); bad += b; methods.add("ocr"); ocr_pages.append(i + 1)
+    verification = {
+        "passes": 3,
+        "glyphs_unanimous": f"{gstats['unanimous']}/{gstats['glyphs']}",
+        "ocr_pages": ocr_pages,
+        "unconfirmed_numbers": bad,
+        "note": "ocr_pages içindeki sayılar sayfa görüntüsünden ayrıca doğrulanmalı" if ocr_pages else "",
+    }
+    return "\n".join(out), "+".join(sorted(methods)), verification
 
 
 def title_of(text: str, issuer_end: int) -> str:
@@ -209,7 +261,11 @@ def read_day(day: str, files: list[Path]) -> dict:
         n, ext = NAME_RE.match(p.name).group(2), NAME_RE.match(p.name).group(3)
         if n is None or ext == "txt":
             continue  # tam sayı PDF'i ve eski .txt dökümleri okunmaz
-        text, method = (htm_text(p), "htm") if ext == "htm" else pdf_text(p)
+        if ext == "htm":
+            text, method, ver = htm_text(p), "htm", {"passes": 1, "unconfirmed_numbers": [],
+                                                    "note": "HTML metin — doğrudan okunur"}
+        else:
+            text, method, ver = pdf_text(p)
         issue = issue or (ISSUE_RE.search(text[:3000]).group(1) if ISSUE_RE.search(text[:3000]) else None)
         im = ISSUER_RE.search(text[:3000])
         issuer = im.group(1).strip() if im else ""
@@ -223,6 +279,7 @@ def read_day(day: str, files: list[Path]) -> dict:
             "energy": any(w in norm(issuer + " " + title + " " + text[:2000]) for w in ENERGY_WORDS),
             "method": method,
             "chars": len(text),
+            "verification": ver,
             "decisions": decisions_of(text),
             "text": text,
         })
@@ -247,7 +304,9 @@ def main(argv: list[str]) -> None:
         print(f"OK {day}: {len(res['items'])} madde · {res['energy_count']} enerji · sayı {res['issue']} → {out.name}")
         for it in res["items"]:
             dec = f" · kararlar {','.join(d['no'] for d in it['decisions'])}" if it["decisions"] else ""
-            print(f"  -{it['n']} [{it['method']}] {'⚡' if it['energy'] else ' '} {it['title'][:90]}{dec}")
+            v = it["verification"]
+            chk = f" · onay {v.get('glyphs_unanimous','-')} · onaysız sayı {len(v['unconfirmed_numbers'])}" if it["method"] != "htm" else ""
+            print(f"  -{it['n']} [{it['method']}] {'⚡' if it['energy'] else ' '} {it['title'][:80]}{dec}{chk}")
         if not keep:
             for p in files:
                 p.unlink()
